@@ -1,0 +1,29 @@
+[tool.poetry]
+name = "deleting-messages-tool"
+version = "1.0.0"
+description = "Script for searching and deleting emails with a rfc-id for the last N days in yandex 360 organizations."
+authors = ["Anton Bryushinin <anton.bryushinin@yandex.ru>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+requests = "2.31.0"
+urllib3 = "^2.2.0"
+pytz = "^2023.4"
+python-dateutil = "^2.8.2"
+pydantic = "2.7.2"
+types-requests = "2.32.0.20240523"
+
+[tool.poetry.dev-dependencies]
+black = "24.3.0"
+flake8 = "7.0.0"
+isort = "5.13.2"
+mypy = "1.9.0"
+
+[[tool.poetry.source]]
+name = "PyPI"
+priority = "primary"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
