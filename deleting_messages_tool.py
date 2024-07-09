@@ -127,31 +127,26 @@ def process_recipients(client: "Client360", recipients: set, rfc_id: str):
             logger.error(f"Connect to {recipient} failed.")
             continue
         logger.info(f"Connect to {recipient} success.")
-        status, folders = connector.list()
+        status, _  = connector.list()
         if status != "OK":
             logger.error("Folders process failed.")
             continue
-        process_folders(connector=connector, folders=folders, rfc_id=rfc_id)
+        process_folders(connector=connector, folder="inbox", rfc_id=rfc_id)
         connector.logout()
 
 
-def process_folders(connector: imaplib.IMAP4_SSL, folders: list, rfc_id: str):
-    for folder in folders:
-        folder = map_folder(folder)
-        if not folder:
-            continue
-        status, _ = connector.select(mailbox=folder, readonly=False)
-        if status != "OK":
-            logger.error("Folder selection failed.")
-        del_status: DeletionStatus = delete(connector=connector, rfc_id=rfc_id)
-        match del_status:
-            case DeletionStatus.Deleted:
-                logger.info(f"Message rfc id: {rfc_id} deleted.")
-                break
-            case DeletionStatus.Empty:
-                logger.info(f"Empty folder {folder} ")
-            case DeletionStatus.NotFound:
-                logger.info(f"Message rfc id: {rfc_id} not found in folder: {folder}")
+def process_folders(connector: imaplib.IMAP4_SSL, folder: str, rfc_id: str):
+    status, _ = connector.select(mailbox=folder, readonly=False)
+    if status != "OK":
+        logger.error("Folder selection failed.")
+    del_status: DeletionStatus = delete(connector=connector, rfc_id=rfc_id)
+    match del_status:
+        case DeletionStatus.Deleted:
+            logger.info(f"Message rfc id: {rfc_id} deleted.")
+        case DeletionStatus.Empty:
+            logger.info(f"Empty folder {folder} ")
+        case DeletionStatus.NotFound:
+            logger.info(f"Message rfc id: {rfc_id} not found in folder: {folder}")
 
 
 def delete(connector: imaplib.IMAP4_SSL, rfc_id: str) -> "DeletionStatus":
