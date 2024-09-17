@@ -1,7 +1,9 @@
 import argparse
+import asyncio
+import concurrent.futures
 import enum
-import imaplib
 import logging
+import os.path
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -10,6 +12,7 @@ from os import environ
 from textwrap import dedent
 from typing import Optional, Union
 
+import aioimaplib
 import requests
 import urllib3
 from pydantic import BaseModel, Field
@@ -85,7 +88,7 @@ def main():
     try:
         settings = get_settings()
     except ValueError:
-        logging.error("ERROR: The value of {ORGANIZATION_ID_ARG} must be an integer.")
+        logging.error(f"ERROR: The value of {ORGANIZATION_ID_ARG} must be an integer.")
         sys.exit(EXIT_CODE)
     except KeyError as key:
         logger.error(f"ERROR: Required environment vars not provided: {key}")
@@ -93,6 +96,8 @@ def main():
         sys.exit(EXIT_CODE)
     rfc_id = args.rfc_message_id
     date_ago = args.date_ago
+    if os.path.exists("Not_connected_users.txt"):
+        os.remove("Not_connected_users.txt")
     logger.info("deleting_messages_tool started.")
     client = Client360(
         token=settings.oauth_token,
@@ -103,6 +108,7 @@ def main():
     fetched_message = fetch_audit_logs(
         client=client, rfc_message_id=rfc_id, date_ago=date_ago
     )
+    print(len(fetched_message.recipients))
     if not fetched_message.subject:
         logger.info("No message for delete.")
         logger.info("deleting_messages_tool finished.")
@@ -110,65 +116,162 @@ def main():
     if is_deletion_approve(
         subject=fetched_message.subject, users=fetched_message.recipients
     ):
-        process_recipients(
-            client=client, recipients=fetched_message.recipients, rfc_id=rfc_id
-        )
+        recipient_batch = list(fetched_message.recipients)
+        try:
+            asyncio.run(
+                process_recipients(
+                    client=client, recipients=recipient_batch, rfc_id=rfc_id
+                )
+            )
+        except ConnectionAbortedError as err:
+            logging.error(err)
     logger.info("deleting_messages_tool finished.")
 
 
-def process_recipients(client: "Client360", recipients: set, rfc_id: str):
-    for recipient in recipients:
-        user_token = client.user_token.get(user_mail=recipient)
-        try:
-            connector = connect_to_mail(
-                username=recipient, access_token=user_token.access_token
+async def process_recipients(client, recipients, rfc_id):
+    loop = asyncio.get_running_loop()
+    async with asyncio.TaskGroup() as tg:
+        for recipient in recipients:
+            try:
+                user_token = client.user_token.get(user_mail=recipient)
+            except ClientOAuthError:
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    await loop.run_in_executor(
+                        pool, log_info, f"Not connected to {recipient}"
+                    )
+                    await loop.run_in_executor(pool, write_error, recipient)
+                continue
+            tg.create_task(
+                process_recipient(recipient, rfc_id, user_token.access_token, loop=loop)
             )
-        except imaplib.IMAP4.error:
-            logger.error(f"Connect to {recipient} failed.")
-            continue
-        logger.info(f"Connect to {recipient} success.")
-        status, _  = connector.list()
-        if status != "OK":
-            logger.error("Folders process failed.")
-            continue
-        process_folders(connector=connector, folder="inbox", rfc_id=rfc_id)
-        connector.logout()
 
 
-def process_folders(connector: imaplib.IMAP4_SSL, folder: str, rfc_id: str):
-    status, _ = connector.select(mailbox=folder, readonly=False)
+def log_info(info="Error"):
+    logger.info(info)
+
+
+def log_error(info="Error"):
+    logger.error(info)
+
+
+def write_error(user: str):
+    with open("Not_connected_users.txt", "a") as file:
+        file.write(f"{user}\n")
+
+
+async def process_recipient(recipient, rfc_id, user_token, loop):
+    try:
+        connector = await asyncio.wait_for(
+            connect_to_mail(username=recipient, access_token=user_token), timeout=10
+        )
+        count = 0
+        while connector.protocol.state != "AUTH" and count < 3:
+            connector = await asyncio.wait_for(
+                connect_to_mail(username=recipient, access_token=user_token), timeout=10
+            )
+            count += 1
+        if count == 3:
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                await loop.run_in_executor(
+                    pool, log_info, f"Not connected to {recipient}"
+                )
+                await loop.run_in_executor(pool, write_error, recipient)
+            return
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            await loop.run_in_executor(pool, log_info, f"Connect to {recipient}")
+    except TimeoutError:
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            await loop.run_in_executor(pool, log_info, f"Not connected to {recipient}")
+        return
+    status, folders = await connector.list('""', "*")
+    folders = [map_folder(folder) for folder in folders if map_folder(folder)]
+    for folder in folders:
+        status = await process_folder(connector, folder, rfc_id, recipient, loop=loop)
+        if status:
+            break
+    if connector.protocol.state != "AUTH":
+        await connector.close()
+    logger.info(f"{recipient} - Disconnect")
+
+
+async def process_folder(connector, folder, rfc_id, user, loop) -> bool:
+    status, body = await connector.select(folder)
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        await loop.run_in_executor(pool, log_info, f"Select {folder} from {user}")
     if status != "OK":
-        logger.error("Folder selection failed.")
-    del_status: DeletionStatus = delete(connector=connector, rfc_id=rfc_id)
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            await loop.run_in_executor(
+                pool, log_error, f"Folder selection failed. - {folder}"
+            )
+        return False
+    try:
+        del_status: DeletionStatus = await asyncio.wait_for(
+            delete(connector=connector, rfc_id=rfc_id, loop=loop), timeout=90
+        )
+    except TimeoutError:
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            await loop.run_in_executor(
+                pool, log_error, f"Too long time waiting. - {folder} - {user}"
+            )
+        return False
+    except aioimaplib.aioimaplib.CommandTimeout:
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            await loop.run_in_executor(
+                pool, log_error, f"Too long time waiting. - {folder} - {user}"
+            )
+        return False
     match del_status:
         case DeletionStatus.Deleted:
-            logger.info(f"Message rfc id: {rfc_id} deleted.")
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                await loop.run_in_executor(
+                    pool,
+                    log_info,
+                    f"Message rfc id: {rfc_id} deleted from user {user }.",
+                )
+            return True
         case DeletionStatus.Empty:
-            logger.info(f"Empty folder {folder} ")
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                await loop.run_in_executor(
+                    pool, log_info, f"Empty folder {folder} from {user}"
+                )
+            return False
         case DeletionStatus.NotFound:
-            logger.info(f"Message rfc id: {rfc_id} not found in folder: {folder}")
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                await loop.run_in_executor(
+                    pool,
+                    log_info,
+                    f"Message rfc id: {rfc_id} not found in folder: {folder}",
+                )
+            return False
+    return False
 
 
-def delete(connector: imaplib.IMAP4_SSL, rfc_id: str) -> "DeletionStatus":
-    status, messages = connector.search(None, "ALL")
+async def delete(connector, rfc_id, loop):
+    status, messages = await connector.search("ALL")
     if not messages[0]:
         return DeletionStatus.Empty
     for num in messages[0].split():
-        status, data = connector.fetch(num, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+        try:
+            status, data = await connector.fetch(
+                int(num), "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])"
+            )
+        except aioimaplib.aioimaplib.Abort:
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                await loop.run_in_executor(pool, log_error)
+            return
         if status == "OK":
-            if type(data[0]) is not tuple:
-                continue
-            headers = data[0][1]
+            headers = data[1]
             if rfc_id.encode() in headers:
-                connector.store(num, "+FLAGS", "\\Deleted")
+                await connector.store(int(num), "+FLAGS", "\\Deleted")
                 return DeletionStatus.Deleted
     return DeletionStatus.NotFound
 
 
 def map_folder(folder: Optional[bytes]) -> Optional[str]:
-    if not folder:
+    if not folder or folder == b"LIST Completed.":
         return None
-    return folder.decode().split('"|"')[-1].strip().strip('""')
+    valid = folder.decode("ascii").split('"|"')[-1].strip().strip('""')
+    return f'"{valid}"'
 
 
 def get_settings():
@@ -218,11 +321,12 @@ def generate_oauth(username, access_token):
     return ("user=%s\1auth=Bearer %s\1\1" % (username, access_token)).encode()
 
 
-def connect_to_mail(username: str, access_token: str):
-    imap_connector = imaplib.IMAP4_SSL(DEFAULT_IMAP_SERVER, DEFAULT_IMAP_PORT)
-    imap_connector.authenticate(
-        "XOAUTH2", lambda x: generate_oauth(username, access_token)
+async def connect_to_mail(username: str, access_token: str):
+    imap_connector = aioimaplib.IMAP4_SSL(
+        host=DEFAULT_IMAP_SERVER, port=DEFAULT_IMAP_PORT
     )
+    await imap_connector.wait_hello_from_server()
+    await imap_connector.xoauth2(user=username, token=access_token)
     return imap_connector
 
 
@@ -256,9 +360,7 @@ class AuditLogAPI:
             "afterDate": after_date,
             "pageToken": page_token,
         }
-        response = requests.get(
-            url, headers=headers, params=params, verify=verify
-        )
+        response = requests.get(url, headers=headers, params=params, verify=verify)
         if response.status_code != HTTPStatus.OK.value:
             raise Client360Error(response.status_code)
         audit_log = AuditLog.parse_obj(response.json())
@@ -362,7 +464,7 @@ class Client360Error(ToolError):
     def __str__(self):
         match self.msg:
             case 403:
-                return 'No access rights to the resource.'
+                return "No access rights to the resource."
             case 401:
                 return "Invalid user token."
             case _:
@@ -387,3 +489,4 @@ if __name__ == "__main__":
     except Exception as exp:
         logging.exception(exp)
         sys.exit(EXIT_CODE)
+        
